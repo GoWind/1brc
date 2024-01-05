@@ -51,8 +51,13 @@ function printResults(map) {
     let {min, max, total, count} = map.get(city);
     totalRowCount += count;
   }
-  console.log(`totalrows seen ${totalRowCount}`);
   endTs = process.hrtime.bigint();
+  for(const city of map.keys()) {
+    let {min, max, total, count} = map.get(city);
+    console.log(`${city}: min: ${min}, max: ${max}, avg: ${total/count}`);
+  }
+
+  console.log(`totalrows seen ${totalRowCount}`);
   console.log(`total time is ${endTs-startTs} nanoseconds`); 
   process.exit(0);
 }

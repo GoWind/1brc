@@ -13,7 +13,7 @@ let bytesProcessed = 0;
 let handle =  await open(filepath, "r");
 let stats =  await handle.stat();
 
-
+let globalBuffer = "";
 // console.log(`idx: ${idx}, start: ${startOffset}, end: ${endOffset}`);
 
 if(startOffset > 0) {
@@ -39,22 +39,40 @@ if(endOffset < totalSize) {
 console.log(`${idx}: updated start and endOffset to ${startOffset} to ${endOffset} totaltoRead is ${endOffset-startOffset+1}`);
 
 const readStream = await handle.createReadStream({start: startOffset, end: endOffset});
-const rl = readline.createInterface({
-    input: readStream,
-    crlfDelay: Infinity // To handle Windows line endings
-  });
 
-rl.on('line', (row) => {
-  processRow(row);
-});
+for await (const chunk of readStream) {
+    let res = await handler(chunk);
+    if(res == false) { 
+      break;
+    }
+}
 
-rl.on('close', () => {
- wrapUp();
-});
+async function handler(chunk) {
+  let updatedChunk = globalBuffer.concat(chunk);  
+  let rows = updatedChunk.split("\n");
+  if(rows.length) {
+     if(rows[rows.length-1] == "") {
+        globalBuffer = "";
+        processRows(rows.slice(0, -1));
+     } else {
+       globalBuffer = rows[rows.length-1];
+       processRows(rows.slice(0, -1));
+     } 
+  }
+}
+wrapUp();
+
+function processRows(rows) {
+  for(const row of rows) {
+    processRow(row);
+  }
+}
 
 function processRow(row) {
-  processedCount += 1;
-  if(row == "" || row == "\n") { console.log(`${idx} got blank row ${row}`); }
+  if(row == "" || row == "\n") { console.log(`${idx} got blank row ${row}`); 
+      return;
+    }
+    processedCount += 1;
     let [city, temp] = row.split(';');
     let tempf = parseFloat(temp);
     if(statsmap.has(city)) {
@@ -68,7 +86,6 @@ function processRow(row) {
 }
 
 function wrapUp() {
- rl.close();
  console.log(`${idx} processed ${processedCount}`);
  handle.close();
  parentPort.postMessage({idx: idx, stats: statsmap});
