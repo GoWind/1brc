@@ -3,10 +3,14 @@ const File = std.fs.File;
 const numWorkers = 12;
 const SliceList = std.ArrayList([]const u8);
 const writer = std.io.getStdOut().writer();
-pub const Record = struct { min: i32 = 0, max: i32 = 0, total: i32 = 0, count: u32 = 0 };
+pub const Record = struct { city: []const u8, min: i32 = 0, max: i32 = 0, total: i64 = 0, count: u32 = 0 };
+const RecordList = std.ArrayList(Record);
+
 const TempMap = std.StringHashMap(Record);
-var threadMap: [numWorkers]TempMap = undefined;
+var threadMap: [numWorkers]RecordList = undefined;
 var threads: [numWorkers]std.Thread = undefined;
+const NumList = std.ArrayList(usize);
+const maxSize: usize = 1 << 14;
 pub fn main() !void {
     const start = std.time.nanoTimestamp();
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -28,7 +32,7 @@ pub fn main() !void {
     var globalMap = TempMap.init(threadAllocator);
     var i: usize = 0;
     while (i < numWorkers) : (i += 1) {
-        threadMap[i] = TempMap.init(threadAllocator);
+        threadMap[i] = RecordList.init(threadAllocator);
         const thread = try std.Thread.spawn(.{}, calculate, .{ i, workerSize, threadAllocator, mapping });
         threads[i] = thread;
     }
@@ -37,7 +41,8 @@ pub fn main() !void {
         threads[i].join();
     }
     const totalProcessed = try mergeMaps(threadAllocator, &globalMap, &threadMap);
-    try printGlobalMap(allocator, globalMap);
+    // try printGlobalMapNoSort(&globalMap);
+    try printGlobalMap(allocator, &globalMap);
     const end = std.time.nanoTimestamp();
     try writer.print("{} rows took {d} nanoseconds\n", .{ totalProcessed, end - start });
 }
@@ -48,6 +53,11 @@ fn calculate(
     allocator: std.mem.Allocator,
     file: []u8,
 ) !void {
+    var hashList = try NumList.initCapacity(allocator, maxSize);
+    var indexList = try NumList.initCapacity(allocator, maxSize);
+    hashList.appendNTimesAssumeCapacity(0, maxSize);
+    indexList.appendNTimesAssumeCapacity(1 << 16, maxSize);
+
     const finalEndOffset = file.len - 1;
     var startOffset = idx * workerSize;
     var endOffset = (idx + 1) * workerSize - 1;
@@ -76,18 +86,23 @@ fn calculate(
         } else if (file[j] == '\n') {
             num = file[i..j];
             const temp = parsei32(num);
-
-            const maybeEntry = threadMap[idx].getEntry(city);
-            if (maybeEntry) |entry| {
-                entry.value_ptr.*.count += 1;
-                entry.value_ptr.*.total += temp;
-                entry.value_ptr.*.max = @max(entry.value_ptr.*.max, temp);
-                entry.value_ptr.*.min = @min(entry.value_ptr.*.min, temp);
+            var hashVal = hashSlice(city, maxSize);
+            while (hashList.items[hashVal] != hashVal and hashList.items[hashVal] != 0) {
+                hashVal = (hashVal + 1) & (maxSize - 1);
+            }
+            const entryIdx = indexList.items[hashVal];
+            if (entryIdx == 1 << 16) {
+                const cityNameForRec = try allocator.alloc(u8, city.len);
+                @memcpy(cityNameForRec, city);
+                const rec = Record{ .city = cityNameForRec, .count = 1, .min = temp, .max = temp, .total = temp };
+                try threadMap[idx].append(rec);
+                indexList.items[hashVal] = threadMap[idx].items.len - 1;
+                hashList.items[hashVal] = hashVal;
             } else {
-                const rec = Record{ .count = 1, .min = temp, .max = temp, .total = temp };
-                const k = try allocator.alloc(u8, city.len);
-                @memcpy(k, city);
-                try threadMap[idx].put(k, rec);
+                threadMap[idx].items[entryIdx].count += 1;
+                threadMap[idx].items[entryIdx].total += temp;
+                threadMap[idx].items[entryIdx].max = @max(threadMap[idx].items[entryIdx].max, temp);
+                threadMap[idx].items[entryIdx].min = @min(threadMap[idx].items[entryIdx].min, temp);
             }
             city = undefined;
             num = undefined;
@@ -95,34 +110,30 @@ fn calculate(
             j = i; // j is inc'ed again at end of the loop , thus point to 2nd char in next line
         }
     }
-    var processedCount: usize = 0;
-    var iterator = threadMap[idx].iterator();
-    while (iterator.next()) |entry| {
-        processedCount += entry.value_ptr.*.count;
-    }
 }
 
-fn mergeMaps(alloc: std.mem.Allocator, global: *TempMap, localMaps: []TempMap) !usize {
+fn mergeMaps(alloc: std.mem.Allocator, global: *TempMap, localRecsList: []RecordList) !usize {
     var totalCount: usize = 0;
-    for (localMaps) |m| {
-        var iterator = m.iterator();
-        while (iterator.next()) |kv| {
-            const localRecord = kv.value_ptr.*;
-            totalCount += localRecord.count;
-            const maybeRecord = global.get(kv.key_ptr.*);
+    for (localRecsList) |localRecs| {
+        for (localRecs.items) |rec| {
+            totalCount += rec.count;
+            const maybeRecord = global.getEntry(rec.city);
             if (maybeRecord) |globalRecord| {
-                try global.put(kv.key_ptr.*, Record{ .count = globalRecord.count + localRecord.count, .max = @max(globalRecord.max, localRecord.max), .min = @min(globalRecord.min, localRecord.min), .total = globalRecord.total + localRecord.total });
+                globalRecord.value_ptr.*.count = globalRecord.value_ptr.*.count + rec.count;
+                globalRecord.value_ptr.*.max = @max(globalRecord.value_ptr.*.max, rec.max);
+                globalRecord.value_ptr.*.min = @min(globalRecord.value_ptr.*.min, rec.min);
+                globalRecord.value_ptr.*.total = globalRecord.value_ptr.*.total + rec.total;
             } else {
-                const key = try alloc.alloc(u8, kv.key_ptr.*.len);
-                @memcpy(key, kv.key_ptr.*);
-                try global.put(key, kv.value_ptr.*);
+                const keyCopy = try alloc.alloc(u8, rec.city.len);
+                @memcpy(keyCopy, rec.city);
+                try global.put(keyCopy, Record{ .city = keyCopy, .count = rec.count, .total = rec.total, .min = rec.min, .max = rec.max });
             }
         }
     }
     return totalCount;
 }
 
-fn printGlobalMap(allocator: std.mem.Allocator, map: TempMap) !void {
+fn printGlobalMap(allocator: std.mem.Allocator, map: *TempMap) !void {
     var keyList = SliceList.init(allocator);
     defer keyList.deinit();
     var keyIterator = map.keyIterator();
@@ -147,6 +158,18 @@ fn printGlobalMap(allocator: std.mem.Allocator, map: TempMap) !void {
     }
 }
 
+fn printGlobalMapNoSort(map: *TempMap) !void {
+   var mapvaliter = map.valueIterator();
+   while (mapvaliter.next()) |record| {
+        const min = record.min;
+        const minf: f32 = @floatFromInt(min);
+        const maxf: f32 = @floatFromInt(record.max);
+        const totalf: f32 = @floatFromInt(record.total);
+        const countf: f32 = @floatFromInt(record.count);
+        try writer.print("{s}: min: {d:3.1}, max:{d:3.1}, avg: {d:3.1}\n", .{ record.city, minf / 10.0, maxf / 10.0, totalf / (countf * 10.0) });
+    }
+}
+
 fn parsei32(s: []const u8) i32 {
     var i: usize = 0;
     var num: i32 = 0;
@@ -168,4 +191,13 @@ test "test parsei32" {
     try std.testing.expect(parsei32(&"3".*) == @as(i32, 3));
     try std.testing.expect(parsei32(&"-123.4".*) == @as(i32, -1234));
     try std.testing.expect(parsei32(&"-23.4".*) == @as(i32, -234));
+}
+
+fn hashSlice(data: []u8, totalSize: usize) usize {
+    var k: usize = 0;
+    var hash: usize = 0;
+    while (k < data.len) : (k += 1) {
+        hash = (hash * 31 + data[k]) & (totalSize - 1);
+    }
+    return hash;
 }
